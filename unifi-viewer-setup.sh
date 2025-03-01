@@ -1,6 +1,6 @@
 #!/bin/bash
-# Raspberry Pi 3B UniFi Viewport Setup Guide - OMXPlayer Version
-# This lightweight setup uses OMXPlayer for optimal performance on Raspberry Pi 3B
+# Raspberry Pi 3B UniFi Viewport Setup Guide - Python-VLC Version
+# This setup uses VLC for streaming, which is the modern replacement for OMXPlayer
 
 # 1. Start with a fresh Raspberry Pi OS installation
 # Download Raspberry Pi OS Lite (32-bit) from https://www.raspberrypi.org/software/operating-systems/
@@ -23,10 +23,13 @@
 sudo apt update
 sudo apt full-upgrade -y
 
-# 4. Install required packages (OMXPlayer should be pre-installed, but make sure)
-sudo apt install -y omxplayer ffmpeg jq curl sed grep
+# 4. Install required packages
+sudo apt install -y vlc python3-vlc python3-pip jq curl sed grep python3-dev python3-setuptools
 
-# 5. Create an improved script to retrieve UniFi RTSP URLs with multiple auth methods
+# Optional: Install a minimal X environment if you're starting from a headless OS
+sudo apt install -y --no-install-recommends xserver-xorg x11-xserver-utils xinit openbox
+
+# 5. Create the same improved script to retrieve UniFi RTSP URLs (unchanged)
 cat > ~/get_unifi_streams.sh << 'EOF'
 #!/bin/bash
 # Improved UniFi Protect Streams Script with Multiple Authentication Methods
@@ -308,131 +311,167 @@ EOF
 
 chmod +x ~/get_unifi_streams.sh
 
-# 6. Create an improved script for displaying camera feeds
-cat > ~/display_camera.sh << 'EOF'
-#!/bin/bash
+# 6. Create Python-VLC camera viewer script
+cat > ~/camera_viewer.py << 'EOF'
+#!/usr/bin/env python3
+"""
+UniFi Camera Viewer using Python-VLC
+Displays RTSP camera feeds from UniFi Protect in a rotating cycle
+"""
 
-# Colors for output
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+import os
+import sys
+import time
+import signal
+import logging
+import vlc
+from datetime import datetime
 
-# Function to log with timestamp
-log() {
-  echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-}
-
-# Function to play a single camera stream
-play_camera() {
-    local rtsp_url="$1"
-    local duration="$2"
-    
-    log "Playing stream: $rtsp_url"
-    
-    # Kill any existing OMXPlayer instances
-    killall omxplayer.bin >/dev/null 2>&1
-    
-    # Start OMXPlayer with the stream
-    # --timeout: Connection timeout in seconds
-    # --live: Decrease latency for live streams
-    # --no-osd: Don't show on-screen display
-    # --no-keys: Disable keyboard controls
-    # --aspect-mode fill: Fill the screen with the video
-    timeout "$duration" omxplayer --timeout 10 --live --no-osd --no-keys --aspect-mode fill "$rtsp_url" >/dev/null 2>&1
-    
-    return $?
-}
-
-# Check if URL is provided
-if [ -z "$1" ]; then
-    log "${RED}Error: No RTSP URL provided${NC}"
-    log "Usage: $0 <rtsp_url> [duration_in_seconds]"
-    exit 1
-fi
-
-RTSP_URL="$1"
-DURATION="${2:-300}"  # Default 5 minutes if not specified
-
-play_camera "$RTSP_URL" "$DURATION"
-EOF
-
-chmod +x ~/display_camera.sh
-
-# 7. Create an improved script to cycle through cameras
-cat > ~/cycle_cameras.sh << 'EOF'
-#!/bin/bash
-
-# Colors for output
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(os.path.expanduser("~/camera_cycle.log")),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Configuration
-RTSP_URLS_FILE=~/rtsp_urls.txt
-ROTATION_INTERVAL=60  # Seconds to display each camera
-RETRY_INTERVAL=10     # Seconds to wait before retrying on failure
-LOG_FILE=~/camera_cycle.log
+RTSP_URLS_FILE = os.path.expanduser("~/rtsp_urls.txt")
+ROTATION_INTERVAL = 60  # Seconds to display each camera
+DEFAULT_NETWORK_CACHING = 1000  # Default VLC network caching in ms
 
-# Function to log with timestamp
-log() {
-  echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
-
-log "Starting camera cycle script..."
-
-# Check if the RTSP URLs file exists
-if [ ! -f "$RTSP_URLS_FILE" ]; then
-    log "${RED}Error: RTSP URLs file not found at $RTSP_URLS_FILE${NC}"
-    log "Please run get_unifi_streams.sh first to generate this file"
-    exit 1
-fi
-
-# Extract RTSP URLs from the file
-URLS=()
-while read -r line; do
-    # Skip comments and empty lines
-    if [[ "$line" =~ ^rtsp:// ]]; then
-        URLS+=("$line")
-    fi
-done < "$RTSP_URLS_FILE"
-
-# Check if we found any URLs
-if [ ${#URLS[@]} -eq 0 ]; then
-    log "${RED}Error: No RTSP URLs found in $RTSP_URLS_FILE${NC}"
-    log "Make sure your file contains lines starting with rtsp://"
-    exit 1
-fi
-
-log "${GREEN}Found ${#URLS[@]} cameras to display${NC}"
-
-# Main loop to cycle through cameras
-while true; do
-    for url in "${URLS[@]}"; do
-        log "Displaying next camera"
+class CameraViewer:
+    def __init__(self):
+        self.urls = []
+        self.instance = None
+        self.player = None
+        self.playing = False
         
-        # Start displaying the camera with a timeout
-        ~/display_camera.sh "$url" "$ROTATION_INTERVAL"
+        # Set up signal handlers for clean exit
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
         
-        # If the player failed, wait a bit before trying the next camera
-        if [ $? -ne 0 ]; then
-            log "${RED}Error displaying camera. Retrying in $RETRY_INTERVAL seconds...${NC}"
-            sleep "$RETRY_INTERVAL"
-        fi
-    done
+        # Initialize VLC instance
+        self.initialize_vlc()
+        
+    def initialize_vlc(self):
+        """Initialize the VLC instance with proper arguments"""
+        # VLC command line arguments
+        vlc_args = [
+            '--no-audio',                 # No audio
+            '--fullscreen',               # Fullscreen mode
+            '--no-video-title-show',      # No title
+            '--no-osd',                   # No on-screen display
+            f'--network-caching={DEFAULT_NETWORK_CACHING}', # Network buffer
+            '--no-keyboard-events',       # Disable keyboard interaction
+            '--no-mouse-events',          # Disable mouse interaction
+        ]
+        
+        self.instance = vlc.Instance(' '.join(vlc_args))
+        self.player = self.instance.media_player_new()
+        
+        # If we have a display, set it to fullscreen
+        if os.environ.get('DISPLAY'):
+            self.player.set_fullscreen(True)
+        
+        logger.info("VLC initialized")
     
-    # Small pause between cycles
-    sleep 1
-done
+    def load_rtsp_urls(self):
+        """Load RTSP URLs from the config file"""
+        if not os.path.exists(RTSP_URLS_FILE):
+            logger.error(f"RTSP URLs file not found: {RTSP_URLS_FILE}")
+            return False
+            
+        with open(RTSP_URLS_FILE, 'r') as f:
+            lines = f.readlines()
+            
+        # Extract lines that start with rtsp://
+        self.urls = [line.strip() for line in lines if line.strip().startswith('rtsp://')]
+        
+        if not self.urls:
+            logger.error("No RTSP URLs found in the file")
+            return False
+            
+        logger.info(f"Loaded {len(self.urls)} camera URLs")
+        return True
+    
+    def play_camera(self, url):
+        """Play a camera stream"""
+        logger.info(f"Playing stream: {url}")
+        
+        # Stop any current playback
+        if self.playing:
+            self.player.stop()
+            time.sleep(1)
+        
+        # Create a new media and play it
+        media = self.instance.media_new(url)
+        media.add_option(f':network-caching={DEFAULT_NETWORK_CACHING}')
+        media.add_option(':rtsp-timeout=5')  # 5 second RTSP timeout
+        
+        self.player.set_media(media)
+        self.player.play()
+        self.playing = True
+        
+        # Wait a bit for the stream to start
+        time.sleep(2)
+        
+        # Check if playback started successfully
+        state = self.player.get_state()
+        if state in [vlc.State.Error, vlc.State.Ended]:
+            logger.error(f"Failed to play camera stream: {url}")
+            return False
+            
+        return True
+    
+    def cycle_cameras(self):
+        """Main loop to cycle through cameras"""
+        if not self.load_rtsp_urls():
+            return
+            
+        logger.info("Starting camera rotation")
+        
+        while True:
+            for url in self.urls:
+                start_time = time.time()
+                
+                # Try to play the camera
+                success = self.play_camera(url)
+                
+                if success:
+                    # Wait for the rotation interval
+                    while time.time() - start_time < ROTATION_INTERVAL:
+                        # Check if player is still playing
+                        if self.player.get_state() in [vlc.State.Error, vlc.State.Ended]:
+                            logger.warning("Playback stopped unexpectedly")
+                            break
+                        time.sleep(1)
+                else:
+                    # If playback failed, wait a bit before trying the next camera
+                    time.sleep(5)
+    
+    def exit_gracefully(self, signum, frame):
+        """Clean up and exit"""
+        logger.info("Exiting camera viewer...")
+        if self.player:
+            self.player.stop()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    viewer = CameraViewer()
+    viewer.cycle_cameras()
 EOF
 
-chmod +x ~/cycle_cameras.sh
+chmod +x ~/camera_viewer.py
 
-# 8. Create a service to auto-start the camera cycle
+# 7. Create a service to auto-start the camera viewer
 cat > /tmp/unifi-viewer.service << 'EOF'
 [Unit]
-Description=UniFi Camera Viewer using OMXPlayer
+Description=UniFi Camera Viewer using Python-VLC
 After=network-online.target
 Wants=network-online.target
 
@@ -440,7 +479,8 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi
-ExecStart=/home/pi/cycle_cameras.sh
+Environment="DISPLAY=:0"
+ExecStart=/usr/bin/python3 /home/pi/camera_viewer.py
 Restart=always
 RestartSec=10
 
@@ -450,6 +490,64 @@ EOF
 
 sudo mv /tmp/unifi-viewer.service /etc/systemd/system/
 sudo systemctl enable unifi-viewer.service
+
+# 8. Create a setup script for X11 auto-login and VLC setup
+cat > ~/setup_display.sh << 'EOF'
+#!/bin/bash
+
+# Colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+echo -e "${BLUE}Setting up X11 display for camera viewer${NC}"
+
+# Configure auto-login
+sudo raspi-config nonint do_boot_behaviour B4
+
+# Create .xinitrc for the pi user
+cat > ~/.xinitrc << 'INNEREOF'
+#!/bin/sh
+xset s off
+xset -dpms
+xset s noblank
+
+# Hide cursor after 5 seconds of inactivity
+unclutter -idle 5 &
+
+# Start a minimal window manager
+exec openbox-session
+INNEREOF
+
+chmod +x ~/.xinitrc
+
+# Create an openbox autostart to launch the camera viewer
+mkdir -p ~/.config/openbox
+cat > ~/.config/openbox/autostart << 'INNEREOF'
+# Wait a bit for everything to initialize
+sleep 10
+
+# Launch the camera viewer in a terminal
+python3 ~/camera_viewer.py &
+INNEREOF
+
+chmod +x ~/.config/openbox/autostart
+
+# Set up .bash_profile to auto-start X
+cat > ~/.bash_profile << 'INNEREOF'
+# Auto-start X on login on the first console
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+  startx -- -nocursor
+fi
+INNEREOF
+
+echo -e "${GREEN}X11 display setup complete!${NC}"
+echo -e "${YELLOW}The system will automatically start X and launch the camera viewer on boot.${NC}"
+EOF
+
+chmod +x ~/setup_display.sh
 
 # 9. Create an improved setup script to configure UniFi connection settings
 cat > ~/setup_unifi.sh << 'EOF'
@@ -505,14 +603,23 @@ if [[ $RETRIEVE_NOW == "y" || $RETRIEVE_NOW == "Y" ]]; then
         echo -e "${GREEN}Found $CAMERA_COUNT cameras.${NC}"
         
         echo ""
+        echo "Would you like to set up the display for viewing cameras? (y/n)"
+        read SETUP_DISPLAY
+        
+        if [[ $SETUP_DISPLAY == "y" || $SETUP_DISPLAY == "Y" ]]; then
+            echo -e "${YELLOW}Setting up display...${NC}"
+            ~/setup_display.sh
+        fi
+        
+        echo ""
         echo "Would you like to start viewing cameras now? (y/n)"
         read START_NOW
         
         if [[ $START_NOW == "y" || $START_NOW == "Y" ]]; then
             echo -e "${YELLOW}Starting camera viewer...${NC}"
-            ~/cycle_cameras.sh
+            python3 ~/camera_viewer.py
         else
-            echo "You can start viewing cameras later by running: ~/cycle_cameras.sh"
+            echo "You can start viewing cameras later by running: python3 ~/camera_viewer.py"
         fi
     else
         echo ""
@@ -540,7 +647,7 @@ NC='\033[0m' # No Color
 # Configuration
 CHECK_INTERVAL=60  # Check every minute
 LOG_FILE=~/watchdog.log
-MEMORY_THRESHOLD=50  # MB
+MEMORY_THRESHOLD=100  # MB
 
 # Function to log with timestamp
 log() {
@@ -550,32 +657,32 @@ log() {
 log "Starting camera viewer watchdog..."
 
 while true; do
-    # Check if the cycle_cameras.sh script is running
-    if ! pgrep -f "cycle_cameras.sh" > /dev/null; then
+    # Check if the Python camera viewer script is running
+    if ! pgrep -f "camera_viewer.py" > /dev/null; then
         log "${RED}Camera viewer not running. Restarting...${NC}"
-        ~/cycle_cameras.sh >> ~/camera_cycle.log 2>&1 &
+        python3 ~/camera_viewer.py >> ~/camera_cycle.log 2>&1 &
         sleep 5
         
         # Verify it started
-        if pgrep -f "cycle_cameras.sh" > /dev/null; then
+        if pgrep -f "camera_viewer.py" > /dev/null; then
             log "${GREEN}Camera viewer restarted successfully.${NC}"
         else
             log "${RED}Failed to restart camera viewer!${NC}"
         fi
     fi
     
-    # Check for zombie OMXPlayer processes
-    ZOMBIE_COUNT=$(ps aux | grep defunct | grep omxplayer | wc -l)
+    # Check for zombie VLC processes
+    ZOMBIE_COUNT=$(ps aux | grep defunct | grep vlc | wc -l)
     if [ $ZOMBIE_COUNT -gt 0 ]; then
-        log "${YELLOW}Found $ZOMBIE_COUNT zombie OMXPlayer processes. Cleaning up...${NC}"
-        killall -9 omxplayer.bin >/dev/null 2>&1
+        log "${YELLOW}Found $ZOMBIE_COUNT zombie VLC processes. Cleaning up...${NC}"
+        pkill -9 vlc >/dev/null 2>&1
     fi
     
     # Check memory usage
     FREE_MEM=$(free -m | grep Mem | awk '{print $4}')
     if [ $FREE_MEM -lt $MEMORY_THRESHOLD ]; then
-        log "${RED}Low memory ($FREE_MEM MB). Killing OMXPlayer processes...${NC}"
-        killall omxplayer.bin >/dev/null 2>&1
+        log "${RED}Low memory ($FREE_MEM MB). Killing VLC processes...${NC}"
+        pkill vlc >/dev/null 2>&1
         sleep 5
     fi
     
@@ -599,7 +706,7 @@ chmod +x ~/watchdog.sh
 # Add watchdog to crontab
 (crontab -l 2>/dev/null; echo "@reboot ~/watchdog.sh &") | crontab -
 
-# 11. Create an improved status checking script
+# 11. Create a status checking script
 cat > ~/check_status.sh << 'EOF'
 #!/bin/bash
 
@@ -644,10 +751,11 @@ if [ -n "$UNIFI_HOST" ]; then
     fi
 fi
 
-# Check if the viewer is running
-if pgrep -f "cycle_cameras.sh" > /dev/null; then
+# Check if the Python viewer is running
+if pgrep -f "camera_viewer.py" > /dev/null; then
     echo -e "${GREEN}✅ Camera viewer: Running${NC}"
-    RUNTIME=$(ps -o etime= -p $(pgrep -f "cycle_cameras.sh" | head -1))
+    VIEWER_PID=$(pgrep -f "camera_viewer.py" | head -1)
+    RUNTIME=$(ps -o etime= -p $VIEWER_PID)
     echo "   Running for: $RUNTIME"
 else
     echo -e "${RED}❌ Camera viewer: Not running${NC}"
@@ -660,12 +768,19 @@ else
     echo -e "${RED}❌ Watchdog: Not running${NC}"
 fi
 
-# Check for OMXPlayer processes
-OMXPLAYER_COUNT=$(pgrep -c omxplayer.bin || echo 0)
-if [ $OMXPLAYER_COUNT -gt 0 ]; then
-    echo -e "${GREEN}✅ OMXPlayer: $OMXPLAYER_COUNT instance(s) running${NC}"
+# Check for VLC processes
+VLC_COUNT=$(pgrep -c vlc || echo 0)
+if [ $VLC_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✅ VLC: $VLC_COUNT instance(s) running${NC}"
 else
-    echo -e "${YELLOW}⚠️ OMXPlayer: No instances running${NC}"
+    echo -e "${YELLOW}⚠️ VLC: No instances running${NC}"
+fi
+
+# Check X display
+if ps aux | grep X | grep -v grep > /dev/null; then
+    echo -e "${GREEN}✅ X display: Running${NC}"
+else
+    echo -e "${YELLOW}⚠️ X display: Not running${NC}"
 fi
 
 # Check system status
@@ -740,10 +855,10 @@ chmod +x ~/check_status.sh
 
 # 12. Create improved README
 cat > ~/README.txt << 'EOF'
-UniFi Camera Viewer - OMXPlayer Edition
-======================================
+UniFi Camera Viewer - Python-VLC Edition
+=======================================
 
-This setup uses OMXPlayer to display UniFi Protect camera feeds on your Raspberry Pi.
+This setup uses Python-VLC to display UniFi Protect camera feeds on your Raspberry Pi.
 It supports multiple authentication methods to work with different UniFi Protect versions.
 
 Setup Instructions:
@@ -754,13 +869,15 @@ Setup Instructions:
 
 3. The system will automatically retrieve your camera streams and save them.
 
-4. After setup, the viewer will start automatically on boot.
+4. You'll be asked if you want to set up the display - say yes to configure auto-login and X.
+
+5. After setup, the viewer will start automatically on boot.
 
 Useful Commands:
 - Check status: ./check_status.sh
 - Manually retrieve camera streams: ./get_unifi_streams.sh
-- Manually start camera viewer: ./cycle_cameras.sh
-- Change camera rotation time: Edit ROTATION_INTERVAL in ~/cycle_cameras.sh
+- Manually start camera viewer: python3 ~/camera_viewer.py
+- Change camera rotation time: Edit ROTATION_INTERVAL in ~/camera_viewer.py
 
 Troubleshooting:
 - If the viewer fails to authenticate, it will create a template file that you can edit manually
@@ -777,10 +894,19 @@ Finding Camera IDs:
 2. Go to Devices > [Camera Name] > Settings > Advanced
 3. Look for the Device ID or MAC address
 4. Or enable RTSP in camera settings and copy the provided URL
+
+Technical Notes:
+- This setup uses VLC which is more modern than the deprecated OMXPlayer
+- VLC supports hardware acceleration on the Raspberry Pi for efficient video decoding
+- The Python script handles camera cycling and error recovery
+- X11 environment is used to display the video in full screen
 EOF
 
-# 13. Output final message
-echo -e "\e[1;32mUniFi Camera Viewer (OMXPlayer) setup complete!\e[0m"
+# 13. Install additional required packages
+sudo apt install -y unclutter x11-xserver-utils
+
+# 14. Output final message
+echo -e "\e[1;32mUniFi Camera Viewer (Python-VLC) setup complete!\e[0m"
 echo ""
 echo "To finalize setup:"
 echo "1. Run the setup script: ./setup_unifi.sh"
